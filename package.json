@@ -19,12 +19,12 @@
 		"chai": "^4.3.6",
 		"chalk": "^5.1.2",
 		"chromedriver": "^106.0.1",
-		"geckodriver": "^3.1.0",
+		"geckodriver": "^3.2.0",
 		"gulp": "^4.0.2",
 		"gulp-jsbeautify": "^0.1.1",
 		"gulp-plumber": "^1.2.1",
 		"gulp-rename": "^2.0.0",
-		"mocha": "^10.0.0",
+		"mocha": "^10.1.0",
 		"ncp": "^2.0.0",
 		"react": "^18.2.0",
 		"react-dom": "^18.2.0",
@@ -36,8 +36,8 @@
 		"yargs": "^17.6.0",
 		"jsdom": "^20.0.1",
 		"canvas": "^2.10.1",
-		"bufferutil": "^4.0.6",
-		"utf-8-validate": "^5.0.9"
+		"bufferutil": "^4.0.7",
+		"utf-8-validate": "^5.0.10"
 	},
 	"babel": {
 		"presets": [
