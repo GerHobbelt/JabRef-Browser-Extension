@@ -1,4 +1,4 @@
-import { createTranslateEngine, exportItems } from "./sources/translateEngine.js";
+import { exportItems } from "./sources/translateEngine.js";
 
 // Provide a minimal compatibility shim: if `browser` is missing, alias it to `chrome`.
 if (typeof browser === "undefined" && typeof chrome !== "undefined") {
@@ -103,9 +103,14 @@ function installInTab(tab) {
 */
 async function lookForTranslators(tab) {
   console.log("JabRef: Searching for translators for %o", tab);
-  const engine = await createTranslateEngine(tab.url);
-  const translators = await engine.detect();
-  onTranslators(translators, tab.id);
+
+  await initTranslateEngine(tab);
+  const response = await browser.tabs.sendMessage(tab.id, {
+    type: "detectTranslators",
+    url: tab.url,
+  });
+  const translatorsInfo = response?.translatorsInfo || [];
+  onTranslators(translatorsInfo, tab.id);
 }
 
 async function evalInTab(tabsId, code) {
@@ -120,10 +125,84 @@ async function evalInTab(tabsId, code) {
   }
 }
 
+function openErrorPage(message, details = "", stacktrace = "") {
+  browser.tabs.create({
+    url:
+      "/data/error.html?message=" +
+      encodeURIComponent(message) +
+      "&details=" +
+      encodeURIComponent(details ?? "") +
+      "&stacktrace=" +
+      encodeURIComponent(stacktrace ?? ""),
+  });
+}
+
+async function getBaseUrl() {
+  const settings = await browser.storage.sync.get({ httpPort: 23119 });
+  return `http://localhost:${settings.httpPort}/`;
+}
+
+async function sendBibEntryHttp(bibtex) {
+  const baseUrl = await getBaseUrl();
+
+  const health = await fetch(baseUrl, { method: "GET", cache: "no-store" });
+  if (!(health.ok || health.status === 404)) {
+    throw new Error(`JabRef HTTP endpoint unavailable (${health.status})`);
+  }
+
+  const resp = await fetch(baseUrl + "libraries/current/entries", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-bibtex" },
+    body: bibtex,
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => "");
+    throw new Error(`HTTP ${resp.status}${body ? `: ${body}` : ""}`);
+  }
+}
+
+async function sendBibEntryNative(bibtex) {
+  const response = await browser.runtime.sendNativeMessage("org.jabref.jabref", {
+    text: bibtex,
+  });
+  if (response?.message === "ok") {
+    return;
+  }
+
+  if (response?.message === "error") {
+    console.error(
+      `JabRef: Error connecting to JabRef: '${response.output}' at '${response.stacktrace}'`,
+    );
+    handleError(response.output, "", response.stacktrace);
+  }
+
+  console.error(
+    `JabRef: Error connecting to JabRef: '${response.message}' with details '${response.output}' at '${response.stacktrace}'`,
+  );
+  handleError(response.message, response.output, response.stacktrace);
+}
+
+async function sendBibTexToJabRef(bibtex) {
+  await browser.runtime.sendMessage({ onSendToJabRef: "sendToJabRefStarted" });
+  console.log("JabRef: Send BibTeX to JabRef: %o", bibtex);
+
+  try {
+    await sendBibEntryHttp(bibtex);
+    await browser.runtime.sendMessage({ popupClose: "close" });
+    return;
+  } catch (httpError) {
+    console.warn("JabRef: HTTP send failed, falling back to native messaging", httpError);
+  }
+
+  await sendBibEntryNative(bibtex);
+  await browser.runtime.sendMessage({ popupClose: "close" });
+}
+
 function saveAsWebpage(tab) {
   var title = tab.title;
   var url = tab.url;
-  var date = new Date().toISODate();
+  var date = new Date().toISOString();
 
   // Construct a manual Bibtex Entry for the webpage
   var bibtexString = `@misc{,\
@@ -131,14 +210,14 @@ function saveAsWebpage(tab) {
 		url = {${url}},\
 		urlDate={${date}},\
 		}`;
-  Zotero.Connector.sendBibTexToJabRef(bibtexString);
+  sendBibTexToJabRef(bibtexString);
 }
 
 function savePdf(tab) {
   var title = tab.title.replace(".pdf", "");
   var url = tab.url;
   var urlEscaped = tab.url.replace(":", "\\:");
-  var date = new Date().toISODate();
+  var date = new Date().toISOString();
 
   // Construct a manual Bibtex Entry for the PDF
   var bibtexString = `@misc{,\
@@ -147,29 +226,29 @@ function savePdf(tab) {
 		url = {${url}},\
 		urlDate={${date}},\
 		}`;
-  Zotero.Connector.sendBibTexToJabRef(bibtexString);
+  sendBibTexToJabRef(bibtexString);
 }
 
 /*
     Is called after lookForTranslators found matching translators.
     We need to hide or show the page action accordingly.
 */
-function onTranslators(translators, tabId) {
-  if (!translators || translators.length === 0) {
+function onTranslators(translatorsInfo, tabId) {
+  if (!translatorsInfo || translatorsInfo.length === 0) {
     console.log(`JabRef: Found no suitable translators for tab ${tabId}`);
-    tabInfo.set(tabId, { ...tabInfo.get(tabId), translators });
+    tabInfo.set(tabId, { ...tabInfo.get(tabId), translatorsInfo });
     browser.pageAction.show(tabId);
     browser.pageAction.setTitle({
       tabId: tabId,
       title: "Import simple website reference into JabRef",
     });
   } else {
-    console.log(`JabRef: Found translators %o for tab ${tabId}`, translators);
-    tabInfo.set(tabId, { ...tabInfo.get(tabId), translators });
+    console.log(`JabRef: Found translators %o for tab ${tabId}`, translatorsInfo);
+    tabInfo.set(tabId, { ...tabInfo.get(tabId), translatorsInfo });
     browser.pageAction.show(tabId);
     browser.pageAction.setTitle({
       tabId: tabId,
-      title: "Import references into JabRef using " + translators[0].label,
+      title: "Import references into JabRef using " + translatorsInfo[0].label,
     });
   }
 }
@@ -198,34 +277,26 @@ async function initContentScript(tabId) {
   });
 }
 
-async function onPopupOpened(tab, info) {
-  if (!info.translators.length) throw new Error("No translator paths provided");
-
-  // If offscreen is available (Chrome), forward the request so the offscreen
-  // document runs the translator. If not (Firefox), run the translator
-  // from the content script (which has a DOM available, unlike the background page).
+async function initTranslateEngine(tab) {
+  // The basic issue is that the background script doesn't have access
+  // to the DOM.
+  // Depending on the browser, we run the translators thus in:
+  // - the offscreen page (Chrome),
+  // - the content script (Firefox).
   if (browser.offscreen) {
     await initOffscreenDocument();
   } else {
     await initContentScript(tab.id);
   }
+}
+
+async function onPopupOpened(tab, info) {
+  if (!info.translatorsInfo.length) throw new Error("No translator paths provided");
+
   await browser.tabs.sendMessage(tab.id, {
     type: "runTranslators",
     url: tab.url,
-    translatorsInfo: info.translators.map((translator) => {
-      // We cannot send the full translator object as it contains functions
-      return {
-        translatorID: translator.translatorID,
-        translatorType: translator.translatorType,
-        label: translator.label,
-        creator: translator.creator,
-        target: translator.target,
-        priority: translator.priority,
-        path: translator.path,
-        file: translator.file,
-        lastUpdated: translator.lastUpdated,
-      };
-    }),
+    translatorsInfo: info.translatorsInfo,
   });
 }
 
@@ -282,7 +353,7 @@ browser.runtime.onMessage.addListener(async function (message, sender, _sendResp
       if (info && info.isPDF) {
         console.log("JabRef: Export PDF in tab %o", JSON.parse(JSON.stringify(tab)));
         savePdf(tab);
-      } else if (!info.translators) {
+      } else if (!info.translatorsInfo) {
         console.log("JabRef: No translators, simple saving %o", JSON.parse(JSON.stringify(tab)));
         saveAsWebpage(tab);
       } else {
@@ -308,7 +379,7 @@ browser.runtime.onMessage.addListener(async function (message, sender, _sendResp
     } else if (message.type === "offscreenResult") {
       console.debug("JabRef: offscreenResult in background.js: %o", message);
       if (message.error) {
-        await browser.runtime.sendMessage({ type: "offscreenResult", url, error: message.error });
+        console.error("JabRef: Error in offscreen translator execution", message.error);
         return;
       }
       const { url, items } = message;
@@ -317,6 +388,7 @@ browser.runtime.onMessage.addListener(async function (message, sender, _sendResp
       await browser.runtime.sendMessage({ onConvertToBibtex: "convertStarted" });
       const bib = await exportItems(items, conversionMode);
       console.debug("JabRef: Exported BibTeX: %o", bib);
+      await sendBibTexToJabRef(bib);
     } else if (message.eval) {
       console.debug("JabRef: eval in background.js: %o", JSON.parse(JSON.stringify(message.eval)));
       return evalInTab(sender.tab.id, message.eval);

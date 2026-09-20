@@ -20,31 +20,6 @@ class SandboxManager {
    */
   eval(code, functions = [], path) {
     return this.importTranslatorByPath(path, functions);
-
-    for (const fn of functions) {
-      delete this.sandbox[fn];
-    }
-
-    for (const prop of Object.keys(this.sandbox)) {
-      code = "var " + prop + " = this.sandbox." + prop + ";" + code;
-    }
-
-    for (const fn of functions) {
-      if (fn === "detectExport") continue;
-      try {
-        code += "\nthis.sandbox." + fn + " = " + fn + ";";
-      } catch (e) {
-        // ignore
-      }
-    }
-
-    if (path) {
-      code += "\n//# sourceURL=" + encodeURI(path) + "\n";
-    }
-
-    (function () {
-      eval(code);
-    }).call(this);
   }
 
   /**
@@ -97,6 +72,7 @@ class SandboxManager {
 
     let cached = this._moduleCache.get(url);
     if (!cached) {
+      setSandbox(this.sandbox);
       const promise = import(url).then((mod) => {
         cached.module = mod;
         cached.loaded = true;
