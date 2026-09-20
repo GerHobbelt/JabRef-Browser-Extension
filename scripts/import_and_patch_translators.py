@@ -2,12 +2,13 @@
 """
 Clone or add Zotero translators as a submodule under translators/zotero
 and patch each .js file to ensure the initial JSON is commented and
-append ES module exports for legacy translators.
+append ES module exports.
 
 Usage: python3 scripts/import_and_patch_translators.py
 """
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = ROOT / "translators" / "zotero"
 ZOTERO_REPO = "https://github.com/zotero/translators"
+
+SANDBOX_PATH = "../../sources/sandbox.js"
+REQUIRED_SANDBOX_IMPORTS = [
+    "ZU",
+    "Zotero",
+    "Z",
+    "text",
+    "requestJSON",
+    "requestText",
+    "attr",
+]
+FW_LINE_PREFIX = "/* FW LINE 59:b820c6d */"
+TRANSLATOR_EXPORT_CANDIDATES = [
+    "detectWeb",
+    "doWeb",
+    "detectImport",
+    "doImport",
+    "detectSearch",
+    "doSearch",
+    "doExport",
+]
 
 
 def should_ignore(path: Path) -> bool:
@@ -90,11 +112,79 @@ def comment_initial_json(text: str) -> tuple[str, bool]:
     return text, False
 
 
+def _is_function_defined(text: str, fn_name: str) -> bool:
+    patterns = [
+        rf"(^|\n)\s*(?:async\s+)?function\s+{re.escape(fn_name)}\s*\(",
+        rf"(^|\n)\s*(?:var|let|const)\s+{re.escape(fn_name)}\s*=\s*(?:async\s+)?function\b",
+        rf"(^|\n)\s*(?:var|let|const)\s+{re.escape(fn_name)}\s*=\s*(?:async\s+)?\([^)]*\)\s*=>",
+        rf"(^|\n)\s*{re.escape(fn_name)}\s*=\s*(?:async\s+)?function\b",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
 def append_exports(text: str) -> tuple[str, bool]:
-    export_snippet = "\n// Export legacy translator functions as ES module bindings for adapter\nexport { detectWeb, doWeb };\n"
-    if "export { detectWeb, doWeb }" in text:
+    present = [fn for fn in TRANSLATOR_EXPORT_CANDIDATES if _is_function_defined(text, fn)]
+    if not present:
         return text, False
-    return text.rstrip() + export_snippet, True
+
+    export_line = f"export {{ {', '.join(present)} }};"
+    export_snippet = (
+        "\n// Export translator functions as ES module bindings for adapter\n"
+        + export_line
+        + "\n"
+    )
+
+    # Remove a previously generated trailing export block, so reruns stay idempotent
+    generated_block_re = re.compile(
+        r"\n?// Export translator functions as ES module bindings for adapter\n"
+        r"export\s*\{[^}]*\};\s*\Z",
+        re.MULTILINE,
+    )
+    new_text = generated_block_re.sub("", text).rstrip()
+
+    # If an identical export already exists, avoid changing file layout
+    if re.search(rf"(^|\n)\s*{re.escape(export_line)}\s*(\n|\Z)", new_text):
+        return new_text + "\n", new_text != text
+
+    return new_text + export_snippet, True
+
+
+def ensure_sandbox_import(text: str) -> tuple[str, bool]:
+    import_re = re.compile(
+        r"^\s*import\s*\{\s*([^}]*)\}\s*from\s*[\"']\.\./\.\./sources/sandbox\.js[\"'];?\s*$",
+        re.MULTILINE,
+    )
+    match = import_re.search(text)
+
+    if match:
+        new_line = f'import {{ {", ".join(REQUIRED_SANDBOX_IMPORTS)} }} from "{SANDBOX_PATH}";'
+        old_line = match.group(0)
+        if old_line.strip() == new_line:
+            return text, False
+        return text.replace(old_line, new_line), True
+
+    import_line = (
+        f'import {{ {", ".join(REQUIRED_SANDBOX_IMPORTS)} }} from "{SANDBOX_PATH}";\n\n'
+    )
+
+    line_header_re = re.compile(r"^((?:\s*//.*\n)+\s*\n*)")
+    block_header_re = re.compile(r"^(\s*/\*[\s\S]*?\*/\s*\n*)")
+
+    line_match = line_header_re.match(text)
+    if line_match:
+        idx = line_match.end(1)
+        return text[:idx] + import_line + text[idx:], True
+
+    block_match = block_header_re.match(text)
+    if block_match:
+        idx = block_match.end(1)
+        return text[:idx] + import_line + text[idx:], True
+
+    return import_line + text, True
+
+
+def has_fw_line(text: str) -> bool:
+    return any(line.lstrip().startswith(FW_LINE_PREFIX) for line in text.splitlines())
 
 
 def extract_json_from_text(text: str):
@@ -148,24 +238,25 @@ def extract_json_from_text(text: str):
             return None
 
 
-def process_file(path: Path) -> tuple[bool, bool]:
-    changed = False
+def process_file(path: Path) -> tuple[bool, bool, bool, bool]:
     commented = False
-    appended = False
+    imported = False
+    exported = False
 
     text = path.read_text(encoding="utf-8")
-    new_text, did_comment = comment_initial_json(text)
-    if did_comment:
-        commented = True
-        changed = True
 
-    # new_text2, did_append = append_exports(new_text)
-    # if did_append:
-    #     appended = True
-    #     changed = True
-    new_text2 = new_text
+    # Delete old translators that still use the deprecated "Zotero Framework"
+    # These are not valid esm, and are deprecated anyway: https://github.com/zotero/translators/issues/3105
+    if has_fw_line(text):
+        path.unlink()
+        return commented, imported, exported, True
 
-    if changed:
+    text, commented = comment_initial_json(text)
+    
+    text, imported = ensure_sandbox_import(text)
+    text, exported = append_exports(text)
+
+    if commented or imported or exported:
         # backup original
         # bak = path.with_suffix(path.suffix + '.bak')
         # try:
@@ -173,9 +264,9 @@ def process_file(path: Path) -> tuple[bool, bool]:
         #         bak.write_text(text, encoding='utf-8')
         # except Exception:
         #     pass
-        path.write_text(new_text2, encoding="utf-8")
+        path.write_text(text, encoding="utf-8")
 
-    return commented, appended
+    return commented, imported, exported, False
 
 
 def patch_all():
@@ -186,20 +277,26 @@ def patch_all():
 
     total = 0
     commented_count = 0
-    appended_count = 0
+    imported_count = 0
+    exported_count = 0
+    deleted_count = 0
     for f in js_files:
         total += 1
         try:
-            c, a = process_file(f)
-            if c:
+            commented, imported, exported, deleted = process_file(f)
+            if commented:
                 commented_count += 1
-            if a:
-                appended_count += 1
+            if imported:
+                imported_count += 1
+            if exported:
+                exported_count += 1
+            if deleted:
+                deleted_count += 1
         except Exception as e:
             print("Error processing", f, e)
 
     print(
-        f"Processed {total} files: commented {commented_count}, appended exports {appended_count}"
+        f"Processed {total} files: deleted {deleted_count}, commented {commented_count}, sandbox imports updated {imported_count}, exports updated {exported_count}"
     )
 
 
@@ -217,7 +314,6 @@ def generate_manifest():
             continue
 
         header = None
-        import re
 
         # 2) Try to parse a sequence of leading line comments // ... at the top of file
         lines = txt.splitlines()
@@ -238,7 +334,7 @@ def generate_manifest():
             header = extract_json_from_text(cleaned) or None
 
         rel = f.relative_to(ROOT).as_posix()
-        entry = {"path": rel, "label": f.stem, "type": "zotero-legacy"}
+        entry = {"path": rel, "label": f.stem}
         if header:
             if "label" in header:
                 entry["label"] = header.get("label")
@@ -246,8 +342,16 @@ def generate_manifest():
                 entry["translatorID"] = header.get("translatorID")
             if "target" in header:
                 entry["target"] = header.get("target")
+            if "browserSupport" in header:
+                entry["browserSupport"] = header.get("browserSupport")
             if "translatorType" in header:
                 entry["translatorType"] = header.get("translatorType")
+            if "creator" in header:
+                entry["creator"] = header.get("creator")
+            if "priority" in header:
+                entry["priority"] = header.get("priority")
+            if "lastUpdated" in header:
+                entry["lastUpdated"] = header.get("lastUpdated")
 
         out.append(entry)
 
